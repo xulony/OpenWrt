@@ -9,6 +9,7 @@ require "nixio"
 require "luci.util"
 require "luci.sys"
 require "luci.jsonc"
+require "luci.model.ipkg"
 -- these global functions are accessed all the time by the event handler
 -- so caching them is worth the effort
 local tinsert = table.insert
@@ -24,18 +25,27 @@ local proxy = ucic:get_first(name, 'server_subscribe', 'proxy', '0')
 local switch = ucic:get_first(name, 'server_subscribe', 'switch', '1')
 local subscribe_url = ucic:get_first(name, 'server_subscribe', 'subscribe_url', {})
 local filter_words = ucic:get_first(name, 'server_subscribe', 'filter_words', '过期时间/剩余流量')
+local save_words = ucic:get_first(name, 'server_subscribe', 'save_words', '')
+local packet_encoding = luci.model.ipkg.installed("sagernet-core") and ucic:get_first(name, 'global', 'default_packet_encoding', 'xudp') or nil
 local v2_ss = luci.sys.exec('type -t -p ss-redir sslocal') ~= "" and "ss" or "v2ray"
 local v2_tj = luci.sys.exec('type -t -p trojan') ~= "" and "trojan" or "v2ray"
 local log = function(...)
 	print(os.date("%Y-%m-%d %H:%M:%S ") .. table.concat({...}, " "))
 end
 local encrypt_methods_ss = {
+	-- plain
+	"none",
+	"plain",
 	-- aead
 	"aes-128-gcm",
 	"aes-192-gcm",
 	"aes-256-gcm",
 	"chacha20-ietf-poly1305",
-	"xchacha20-ietf-poly1305"
+	"xchacha20-ietf-poly1305",
+	-- aead 2022
+	"2022-blake3-aes-128-gcm",
+	"2022-blake3-aes-256-gcm",
+	"2022-blake3-chacha20-poly1305"
 	--[[ stream
 	"table",
 	"rc4",
@@ -162,9 +172,9 @@ local function processData(szType, content)
 		result.server = info.add
 		result.server_port = info.port
 		result.transport = info.net
-		result.alter_id = info.aid
 		result.vmess_id = info.id
 		result.alias = info.ps
+		result.packet_encoding = packet_encoding
 		-- result.mux = 1
 		-- result.concurrency = 8
 		if info.net == 'ws' then
@@ -192,6 +202,13 @@ local function processData(szType, content)
 			result.read_buffer_size = 2
 			result.write_buffer_size = 2
 		end
+		if info.net == 'grpc' then
+			if info.path then
+				result.serviceName = info.path
+			elseif info.serviceName then
+				result.serviceName = info.serviceName
+			end
+		end
 		if info.net == 'quic' then
 			result.quic_guise = info.type
 			result.quic_key = info.key
@@ -202,10 +219,18 @@ local function processData(szType, content)
 		end
 		if info.tls == "tls" or info.tls == "1" then
 			result.tls = "1"
-			result.tls_host = info.host
+			if info.host then
+				result.tls_host = info.host
+			elseif info.sni then
+				result.tls_host = info.sni
+			end
 			result.insecure = 1
 		else
 			result.tls = "0"
+		end
+		-- https://www.v2fly.org/config/protocols/vmess.html#vmess-md5-认证信息-淘汰机制
+		if info.aid and (tonumber(info.aid) > 0) then
+			result.server = nil
 		end
 	elseif szType == "ss" then
 		local idx_sp = 0
@@ -222,7 +247,9 @@ local function processData(szType, content)
 		local password = userinfo:sub(userinfo:find(":") + 1, #userinfo)
 		result.alias = UrlDecode(alias)
 		result.type = v2_ss
-		result.v2ray_protocol = "shadowsocks"
+		result.v2ray_protocol = (v2_ss == "v2ray") and "shadowsocks" or nil
+		result.encrypt_method_ss = method
+		result.password = password
 		result.server = host[1]
 		if host[2]:find("/%?") then
 			local query = split(host[2], "/%?")
@@ -249,16 +276,13 @@ local function processData(szType, content)
 		else
 			result.server_port = host[2]:gsub("/","")
 		end
-		if checkTabValue(encrypt_methods_ss)[method] then
-			result.encrypt_method_ss = method
-			result.password = password
-		else
+		if not checkTabValue(encrypt_methods_ss)[method] then
 			-- 1202 年了还不支持 SS AEAD 的屑机场
 			result.server = nil
 		end
 	elseif szType == "sip008" then
 		result.type = v2_ss
-		result.v2ray_protocol = "shadowsocks"
+		result.v2ray_protocol = (v2_ss == "v2ray") and "shadowsocks" or nil
 		result.server = content.server
 		result.server_port = content.server_port
 		result.password = content.password
@@ -271,18 +295,20 @@ local function processData(szType, content)
 		end
 	elseif szType == "ssd" then
 		result.type = v2_ss
-		result.v2ray_protocol = "shadowsocks"
+		result.v2ray_protocol = (v2_ss == "v2ray") and "shadowsocks" or nil
 		result.server = content.server
 		result.server_port = content.port
 		result.password = content.password
-		result.encrypt_method_ss = content.encryption
-		result.plugin = content.plugin
+		result.encrypt_method_ss = content.method
 		result.plugin_opts = content.plugin_options
 		result.alias = "[" .. content.airport .. "] " .. content.remarks
-		if checkTabValue(encrypt_methods_ss)[result.encrypt_method_ss] then
-			result.server = nil
-		elseif result.plugin == "simple-obfs" then
+		if content.plugin == "simple-obfs" then
 			result.plugin = "obfs-local"
+		else
+			result.plugin = content.plugin
+		end
+		if not checkTabValue(encrypt_methods_ss)[content.encryption] then
+			result.server = nil
 		end
 	elseif szType == "trojan" then
 		local idx_sp = 0
@@ -345,6 +371,7 @@ local function processData(szType, content)
 			result.vmess_id = uuid
 			result.vless_encryption = params.encryption or "none"
 			result.transport = params.type and (params.type == 'http' and 'h2' or params.type) or "tcp"
+			result.packet_encoding = packet_encoding
 			if not params.type or params.type == "tcp" then
 				if params.security == "xtls" then
 					result.xtls = "1"
@@ -415,12 +442,42 @@ end
 
 local function check_filer(result)
 	do
+		-- 过滤的关键词列表
 		local filter_word = split(filter_words, "/")
+		-- 保留的关键词列表
+		local check_save = false
+		if save_words ~= nil and save_words ~= "" and save_words ~= "NULL" then
+			check_save = true
+		end
+		local save_word = split(save_words, "/")
+
+		-- 检查结果
+		local filter_result = false
+		local save_result = true
+
+		-- 检查是否存在过滤关键词
 		for i, v in pairs(filter_word) do
-			if result.alias:find(v) then
-				-- log('订阅节点关键字过滤:“' .. v ..'” ，该节点被丢弃')
-				return true
+			if tostring(result.alias):find(v, nil, true) then
+				filter_result = true
 			end
+		end
+
+		-- 检查是否打开了保留关键词检查，并且进行过滤
+		if check_save == true then
+			for i, v in pairs(save_word) do
+				if tostring(result.alias):find(v, nil, true) then
+					save_result = false
+				end
+			end
+		else
+			save_result = false
+		end
+
+		-- 不等时返回
+		if filter_result == true or save_result == true then
+			return true
+		else
+			return false
 		end
 	end
 end
@@ -455,7 +512,7 @@ local execute = function()
 					nodes = servers
 				-- SS SIP008 直接使用 Json 格式
 				elseif jsonParse(raw) then
-					nodes = jsonParse(raw)
+					nodes = jsonParse(raw).servers or jsonParse(raw)
 					if nodes[1].server and nodes[1].method then
 						szType = 'sip008'
 					end
